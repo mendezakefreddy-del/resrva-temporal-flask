@@ -28,27 +28,26 @@ let temporizadorMensaje = null;
 let actualizando = false;
 let vencimientoEnProceso = false;
 
-function crearId() {
-  if (window.crypto && window.crypto.randomUUID) {
-    return window.crypto.randomUUID();
-  }
-
-  return `cliente-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-const clienteId = localStorage.getItem("flaskClienteId") || crearId();
-localStorage.setItem("flaskClienteId", clienteId);
+// El folio del visitante lo crea el servidor y vive en su sesion de Flask.
+let clienteId = "";
 
 const nombreGuardado = localStorage.getItem("flaskClienteNombre");
 if (nombreGuardado) {
   elementos.clienteNombre.value = nombreGuardado;
 }
 
-elementos.clienteIdCorto.textContent = clienteId.slice(0, 8);
+async function iniciarSesion() {
+  try {
+    const datos = await solicitud("/api/sesion");
+    clienteId = datos.reserva_id;
+    elementos.clienteIdCorto.textContent = clienteId.slice(0, 8);
+  } catch (error) {
+    mostrarMensaje(error.message, "error");
+  }
+}
 
 function obtenerCliente() {
   return {
-    cliente_id: clienteId,
     cliente_nombre:
       elementos.clienteNombre.value.trim() || "Comprador sin nombre"
   };
@@ -433,7 +432,7 @@ function actualizarContadores() {
 }
 
 comprobarApi();
-cargarBoletos();
+iniciarSesion().then(() => cargarBoletos());
 
 setInterval(actualizarContadores, 1000);
 setInterval(() => cargarBoletos(false), 5000);

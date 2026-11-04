@@ -1,10 +1,11 @@
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, session
 from pymongo import ASCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -12,6 +13,10 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 load_dotenv()
 
 app = Flask(__name__)
+# Firma la cookie de sesion que guarda el folio (reserva_id) de cada visitante.
+# En Render se define como variable de entorno SECRET_KEY.
+app.secret_key = os.getenv("SECRET_KEY", "clave-solo-para-desarrollo-local")
+app.permanent_session_lifetime = timedelta(days=1)
 
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 MONGO_DB = os.getenv("MONGO_DB", "reserva_boletos").strip()
@@ -19,6 +24,8 @@ RESERVA_SEGUNDOS = max(15, min(int(os.getenv("RESERVA_SEGUNDOS", "60")), 1800))
 
 cliente_mongo = None
 boletos = None
+reservas = None
+compras = None
 
 
 def ahora_utc():
@@ -26,7 +33,7 @@ def ahora_utc():
 
 
 def obtener_coleccion():
-    global cliente_mongo, boletos
+    global cliente_mongo, boletos, reservas, compras
 
     if not MONGO_URI:
         raise RuntimeError(
@@ -41,6 +48,8 @@ def obtener_coleccion():
         )
         base_datos = cliente_mongo[MONGO_DB]
         boletos = base_datos["boletos"]
+        reservas = base_datos["reservas"]
+        compras = base_datos["compras"]
         boletos.create_index(
             [("evento", ASCENDING), ("asiento", ASCENDING)],
             unique=True,
@@ -48,6 +57,16 @@ def obtener_coleccion():
         )
         boletos.create_index("estado")
         boletos.create_index("reserva_hasta")
+        # Un boleto solo puede tener una reserva activa a la vez.
+        reservas.create_index(
+            "recurso_id",
+            unique=True,
+            partialFilterExpression={"estado": "activa"},
+            name="una_reserva_activa_por_boleto",
+        )
+        reservas.create_index("vence_en")
+        reservas.create_index("reserva_id")
+        compras.create_index("comprada_en")
 
     return boletos
 
@@ -125,11 +144,52 @@ def validar_datos_boleto(datos):
     }
 
 
+def obtener_reserva_id():
+    """Folio del visitante, creado por el servidor y guardado en su sesion."""
+    if not session.get("reserva_id"):
+        session.permanent = True
+        session["reserva_id"] = uuid.uuid4().hex
+    return session["reserva_id"]
+
+
+def en_transaccion(funcion):
+    """Ejecuta funcion(sesion_mongo) como una transaccion de MongoDB Atlas."""
+    obtener_coleccion()
+    with cliente_mongo.start_session() as sesion_mongo:
+        return sesion_mongo.with_transaction(funcion)
+
+
+def serializar_reserva(documento):
+    return {
+        "_id": str(documento["_id"]),
+        "reserva_id": documento.get("reserva_id"),
+        "recurso_id": str(documento.get("recurso_id")),
+        "asiento": documento.get("asiento"),
+        "cantidad": documento.get("cantidad", 1),
+        "estado": documento.get("estado"),
+        "creada_en": convertir_fecha(documento.get("creada_en")),
+        "vence_en": convertir_fecha(documento.get("vence_en")),
+        "cerrada_en": convertir_fecha(documento.get("cerrada_en")),
+    }
+
+
+def serializar_compra(documento):
+    return {
+        "_id": str(documento["_id"]),
+        "boleto_id": str(documento.get("boleto_id")),
+        "evento": documento.get("evento"),
+        "asiento": documento.get("asiento"),
+        "precio": documento.get("precio"),
+        "comprador_nombre": documento.get("comprador_nombre"),
+        "comprada_en": convertir_fecha(documento.get("comprada_en")),
+    }
+
+
 def obtener_cliente(datos):
-    cliente_id = limpiar_texto(datos.get("cliente_id"))
+    cliente_id = obtener_reserva_id()
     cliente_nombre = limpiar_texto(datos.get("cliente_nombre"))
 
-    if not cliente_id or not cliente_nombre:
+    if not cliente_nombre:
         raise ValueError("Es necesario identificar al comprador.")
 
     return cliente_id, cliente_nombre
@@ -138,6 +198,11 @@ def obtener_cliente(datos):
 def liberar_reservas_vencidas():
     coleccion = obtener_coleccion()
     momento = ahora_utc()
+
+    reservas.update_many(
+        {"estado": "activa", "vence_en": {"$lte": momento}},
+        {"$set": {"estado": "vencida", "cerrada_en": momento}},
+    )
 
     return coleccion.update_many(
         {
@@ -307,39 +372,89 @@ def eliminar_boleto(boleto_id):
     return jsonify({"mensaje": "Boleto eliminado correctamente."})
 
 
+@app.get("/api/sesion")
+def datos_sesion():
+    return jsonify({"reserva_id": obtener_reserva_id()})
+
+
+@app.get("/api/reservas")
+def listar_reservas():
+    obtener_coleccion()
+    liberar_reservas_vencidas()
+    documentos = reservas.find().sort("creada_en", -1).limit(50)
+    return jsonify([serializar_reserva(d) for d in documentos])
+
+
+@app.get("/api/compras")
+def listar_compras():
+    obtener_coleccion()
+    documentos = compras.find().sort("comprada_en", -1).limit(50)
+    return jsonify([serializar_compra(d) for d in documentos])
+
+
 @app.post("/api/boletos/<boleto_id>/reservar")
 def reservar_boleto(boleto_id):
     coleccion = obtener_coleccion()
     datos = request.get_json(silent=True) or {}
     cliente_id, cliente_nombre = obtener_cliente(datos)
+    boleto_oid = obtener_object_id(boleto_id)
     momento = ahora_utc()
     reserva_hasta = momento + timedelta(seconds=RESERVA_SEGUNDOS)
 
-    documento = coleccion.find_one_and_update(
-        {
-            "_id": obtener_object_id(boleto_id),
-            "$or": [
-                {"estado": "disponible"},
-                {
+    def operacion(sesion_mongo):
+        # La condicion de disponibilidad va dentro de la misma operacion
+        # que cambia el boleto: si otra persona llego primero, no coincide.
+        documento = coleccion.find_one_and_update(
+            {
+                "_id": boleto_oid,
+                "$or": [
+                    {"estado": "disponible"},
+                    {
+                        "estado": "reservado",
+                        "reserva_hasta": {"$lte": momento},
+                    },
+                ],
+            },
+            {
+                "$set": {
                     "estado": "reservado",
-                    "reserva_hasta": {"$lte": momento},
-                },
-            ],
-        },
-        {
-            "$set": {
-                "estado": "reservado",
-                "reservado_por": cliente_id,
-                "reservado_nombre": cliente_nombre,
-                "reserva_hasta": reserva_hasta,
-                "comprado_por": None,
-                "comprado_nombre": None,
-                "comprado_en": None,
-                "actualizado_en": momento,
-            }
-        },
-        return_document=ReturnDocument.AFTER,
-    )
+                    "reservado_por": cliente_id,
+                    "reservado_nombre": cliente_nombre,
+                    "reserva_hasta": reserva_hasta,
+                    "comprado_por": None,
+                    "comprado_nombre": None,
+                    "comprado_en": None,
+                    "actualizado_en": momento,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+            session=sesion_mongo,
+        )
+
+        if documento is None:
+            return None
+
+        # Cierra una reserva anterior vencida de este mismo boleto.
+        reservas.update_many(
+            {"recurso_id": boleto_oid, "estado": "activa"},
+            {"$set": {"estado": "vencida", "cerrada_en": momento}},
+            session=sesion_mongo,
+        )
+        reservas.insert_one(
+            {
+                "reserva_id": cliente_id,
+                "recurso_id": boleto_oid,
+                "asiento": documento.get("asiento"),
+                "cantidad": 1,
+                "estado": "activa",
+                "creada_en": momento,
+                "vence_en": reserva_hasta,
+            },
+            session=sesion_mongo,
+        )
+        return documento
+
+    documento = en_transaccion(operacion)
 
     if not documento:
         return jsonify(
@@ -361,29 +476,43 @@ def reservar_boleto(boleto_id):
 @app.post("/api/boletos/<boleto_id>/cancelar")
 def cancelar_reserva(boleto_id):
     coleccion = obtener_coleccion()
-    datos = request.get_json(silent=True) or {}
-    cliente_id = limpiar_texto(datos.get("cliente_id"))
+    cliente_id = obtener_reserva_id()
+    boleto_oid = obtener_object_id(boleto_id)
+    momento = ahora_utc()
 
-    if not cliente_id:
-        raise ValueError("Falta identificar al comprador.")
+    def operacion(sesion_mongo):
+        documento = coleccion.find_one_and_update(
+            {
+                "_id": boleto_oid,
+                "estado": "reservado",
+                "reservado_por": cliente_id,
+            },
+            {
+                "$set": {
+                    "estado": "disponible",
+                    "reservado_por": None,
+                    "reservado_nombre": None,
+                    "reserva_hasta": None,
+                    "actualizado_en": momento,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+            session=sesion_mongo,
+        )
 
-    documento = coleccion.find_one_and_update(
-        {
-            "_id": obtener_object_id(boleto_id),
-            "estado": "reservado",
-            "reservado_por": cliente_id,
-        },
-        {
-            "$set": {
-                "estado": "disponible",
-                "reservado_por": None,
-                "reservado_nombre": None,
-                "reserva_hasta": None,
-                "actualizado_en": ahora_utc(),
-            }
-        },
-        return_document=ReturnDocument.AFTER,
-    )
+        if documento is not None:
+            reservas.update_one(
+                {
+                    "recurso_id": boleto_oid,
+                    "reserva_id": cliente_id,
+                    "estado": "activa",
+                },
+                {"$set": {"estado": "cancelada", "cerrada_en": momento}},
+                session=sesion_mongo,
+            )
+        return documento
+
+    documento = en_transaccion(operacion)
 
     if not documento:
         return jsonify(
@@ -403,29 +532,62 @@ def confirmar_compra(boleto_id):
     coleccion = obtener_coleccion()
     datos = request.get_json(silent=True) or {}
     cliente_id, cliente_nombre = obtener_cliente(datos)
+    boleto_oid = obtener_object_id(boleto_id)
     momento = ahora_utc()
 
-    documento = coleccion.find_one_and_update(
-        {
-            "_id": obtener_object_id(boleto_id),
-            "estado": "reservado",
-            "reservado_por": cliente_id,
-            "reserva_hasta": {"$gt": momento},
-        },
-        {
-            "$set": {
-                "estado": "comprado",
-                "comprado_por": cliente_id,
-                "comprado_nombre": cliente_nombre,
-                "comprado_en": momento,
-                "reservado_por": None,
-                "reservado_nombre": None,
-                "reserva_hasta": None,
-                "actualizado_en": momento,
-            }
-        },
-        return_document=ReturnDocument.AFTER,
-    )
+    def operacion(sesion_mongo):
+        # El servidor vuelve a revisar la hora: el contador solo informa.
+        documento = coleccion.find_one_and_update(
+            {
+                "_id": boleto_oid,
+                "estado": "reservado",
+                "reservado_por": cliente_id,
+                "reserva_hasta": {"$gt": momento},
+            },
+            {
+                "$set": {
+                    "estado": "comprado",
+                    "comprado_por": cliente_id,
+                    "comprado_nombre": cliente_nombre,
+                    "comprado_en": momento,
+                    "reservado_por": None,
+                    "reservado_nombre": None,
+                    "reserva_hasta": None,
+                    "actualizado_en": momento,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+            session=sesion_mongo,
+        )
+
+        if documento is None:
+            return None
+
+        reservas.update_one(
+            {
+                "recurso_id": boleto_oid,
+                "reserva_id": cliente_id,
+                "estado": "activa",
+            },
+            {"$set": {"estado": "confirmada", "cerrada_en": momento}},
+            session=sesion_mongo,
+        )
+        compras.insert_one(
+            {
+                "boleto_id": boleto_oid,
+                "reserva_id": cliente_id,
+                "evento": documento.get("evento"),
+                "zona": documento.get("zona"),
+                "asiento": documento.get("asiento"),
+                "precio": documento.get("precio"),
+                "comprador_nombre": cliente_nombre,
+                "comprada_en": momento,
+            },
+            session=sesion_mongo,
+        )
+        return documento
+
+    documento = en_transaccion(operacion)
 
     if not documento:
         liberar_reservas_vencidas()
